@@ -33,6 +33,9 @@ NAV_TILE = TILE
 BUILD_RADIUS = 220
 MINIMAP_W = 214
 MINIMAP_H = 118
+REPAIR_COST = 10
+REPAIR_HP = 20
+REPAIR_INTERVAL = 0.45
 
 TEAM_RED = "soviet"
 TEAM_BLUE = "allied"
@@ -581,6 +584,10 @@ class Game:
     game_over: bool = False
     winner: str | None = None
     placing: str | None = None
+    repair_mode: bool = False
+    repair_target_id: int | None = None
+    repair_timer: float = 0
+    sell_mode: bool = False
     message: str = "Select a difficulty."
     message_timer: float = 0
     drag_start: tuple | None = None
@@ -703,6 +710,10 @@ class Game:
             except Exception:
                 pass
 
+    def play_cursor_click(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 2, 3, 4, 5):
+            self.play("click")
+
     def music(self, key):
         try:
             if self.music_mode == key or key not in self.sounds:
@@ -779,6 +790,10 @@ class Game:
         self.game_over = False
         self.winner = None
         self.placing = None
+        self.repair_mode = False
+        self.repair_target_id = None
+        self.repair_timer = 0
+        self.sell_mode = False
         self.camera = Camera(360, 620, 1.0)
         self.message = "Awaiting orders, Commander."
         self.message_timer = 4
@@ -958,6 +973,7 @@ class Game:
         self.update_training(dt)
         self.update_ore(dt)
         self.update_radar_heal(dt)
+        self.update_repair(dt)
         for entity in list(self.entities):
             self.update_combat(entity, dt)
             if entity.kind == "unit":
@@ -1006,15 +1022,73 @@ class Game:
         if self.training_timer >= train_time:
             self.training_timer = 0
             self.training_queue.pop(0)
-            producer = "warfactory" if unit_type in ("rhino", "v3", "apocalypse") else "barracks"
-            src = next((e for e in self.entities if e.team == TEAM_RED and e.type == producer), None)
-            if not src:
-                src = next((e for e in self.entities if e.team == TEAM_RED and e.type in ("barracks", "warfactory")), None)
-            sx, sy = (300, 650) if not src else (src.x + src.w / 2, src.y + src.h + 20)
-            unit = self.spawn_unit(unit_type, sx + random.uniform(-24, 24), sy + random.uniform(0, 30), TEAM_RED)
-            self.entities.append(unit)
+            self.release_trained_unit(unit_type)
             self.alert(f"{UNIT_DEFS[unit_type]['name']} ready")
             self.play("unit_ready")
+
+    def producer_type_for_unit(self, unit_type):
+        return "warfactory" if UNIT_DEFS[unit_type]["category"] == "vehicle" else "barracks"
+
+    def find_producer(self, unit_type, team=TEAM_RED):
+        producer_type = self.producer_type_for_unit(unit_type)
+        return next((e for e in self.entities if e.team == team and e.type == producer_type), None)
+
+    def release_trained_unit(self, unit_type):
+        producer = self.find_producer(unit_type)
+        exit_x, exit_y, rally_x, rally_y = self.production_exit_points(producer, unit_type)
+        unit = self.spawn_unit(unit_type, exit_x, exit_y, TEAM_RED)
+        unit.state = "move"
+        self.entities.append(unit)
+        self.set_unit_destination(unit, rally_x, rally_y)
+
+        if producer:
+            label = "VEHICLE BAY" if producer.type == "warfactory" else "INFANTRY EXIT"
+            color = (255, 190, 70) if producer.type == "warfactory" else (120, 230, 255)
+            self.add_burst(exit_x, exit_y, color, 12)
+            self.particles.append(Particle(producer.x + producer.w / 2, producer.y - 12, 0, -18, 1.1, color, 1, label))
+
+    def production_exit_points(self, producer, unit_type):
+        size = UNIT_DEFS[unit_type]["size"]
+        if not producer:
+            exit_x, exit_y = 300, 650
+            return exit_x, exit_y, exit_x + 80, exit_y + 40
+
+        exit_x = producer.x + producer.w / 2
+        exit_y = producer.y + producer.h + size + NAV_TILE + 4
+        if producer.type == "warfactory":
+            exit_y = producer.y + producer.h + size + NAV_TILE + 10
+            rally_x = exit_x + 95
+            rally_y = exit_y + 35
+        else:
+            rally_x = exit_x + 55
+            rally_y = exit_y + 55
+
+        exit_x = clamp(exit_x, size, WORLD_W - size)
+        exit_y = clamp(exit_y, size, WORLD_H - size)
+        rally_x = clamp(rally_x, size, WORLD_W - size)
+        rally_y = clamp(rally_y, size, WORLD_H - size)
+        exit_x, exit_y = self.nearest_walkable_release_point(exit_x, exit_y, size)
+        return exit_x, exit_y, rally_x, rally_y
+
+    def nearest_walkable_release_point(self, x, y, size):
+        if self.nav_grid.is_walkable_world(x, y):
+            return x, y
+        offsets = [
+            (0, NAV_TILE),
+            (NAV_TILE, NAV_TILE),
+            (-NAV_TILE, NAV_TILE),
+            (NAV_TILE * 2, NAV_TILE),
+            (-NAV_TILE * 2, NAV_TILE),
+            (0, NAV_TILE * 2),
+            (NAV_TILE * 2, NAV_TILE * 2),
+            (-NAV_TILE * 2, NAV_TILE * 2),
+        ]
+        for dx, dy in offsets:
+            nx = clamp(x + dx, size, WORLD_W - size)
+            ny = clamp(y + dy, size, WORLD_H - size)
+            if self.nav_grid.is_walkable_world(nx, ny):
+                return nx, ny
+        return x, y
 
     def update_ore(self, dt):
         for ore in self.ore:
@@ -1047,6 +1121,33 @@ class Game:
             if entity.team == TEAM_RED and entity.hp < entity.max_hp:
                 if any(entity_distance(entity, radar) < 300 for radar in radars):
                     entity.hp = min(entity.max_hp, entity.hp + 3)
+
+    def update_repair(self, dt):
+        if not self.repair_target_id:
+            return
+        target = self.entity_by_id(self.repair_target_id)
+        if not target or target.kind != "structure" or target.team != TEAM_RED:
+            self.repair_target_id = None
+            return
+        if target.hp >= target.max_hp:
+            self.repair_target_id = None
+            self.alert("Repairs complete")
+            return
+
+        self.repair_timer -= dt
+        if self.repair_timer > 0:
+            return
+        if self.credits < REPAIR_COST:
+            self.repair_target_id = None
+            self.alert("Insufficient credits for repair")
+            self.play("insufficient")
+            return
+
+        self.credits -= REPAIR_COST
+        target.hp = min(target.max_hp, target.hp + REPAIR_HP)
+        self.repair_timer = REPAIR_INTERVAL
+        cx, cy = target.center()
+        self.particles.append(Particle(cx, target.y - 8, 0, -16, 0.55, (120, 235, 255), 1, f"+{REPAIR_HP} HP"))
 
     def update_combat(self, entity, dt):
         if entity.atk <= 0:
@@ -1218,6 +1319,9 @@ class Game:
             self.alert("Insufficient credits")
             self.play("insufficient")
             return
+        self.repair_mode = False
+        self.repair_target_id = None
+        self.sell_mode = False
         self.placing = struct_type
         self.alert(f"Place {data['name']} with left click")
         self.play("new_options")
@@ -1303,10 +1407,13 @@ class Game:
 
     def event(self, event):
         if event.type == pygame.QUIT:
+            pygame.mouse.set_visible(True)
             pygame.quit()
             sys.exit()
         if event.type == pygame.KEYDOWN:
             self.keydown(event.key)
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            self.play_cursor_click(event)
 
         # 1. Handle clicks when game is paused (left-click only — block everything else)
         if self.paused and self.difficulty:
@@ -1314,7 +1421,6 @@ class Game:
                 # Top-bar pause button toggles resume
                 pause_rect = pygame.Rect(SCREEN_W - 38, 10, 26, 26)
                 if pause_rect.collidepoint(event.pos):
-                    self.play("click")
                     self.paused = False
                     self.play("affirmative")
                     return
@@ -1324,17 +1430,12 @@ class Game:
             return
 
         if not self.difficulty:
-            if event.type in (pygame.MOUSEBUTTONUP, pygame.MOUSEBUTTONDOWN):
-                print(f"[MENU] Button {event.button} {event.type} at {event.pos}", file=sys.stderr)
+            if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button in (1, 2, 3):
                     mx, my = event.pos
                     for key, rect in self.menu_cards():
                         if rect.collidepoint(mx, my):
                             self.start(key)
-                            try:
-                                self.play("click")
-                            except Exception:
-                                pass
                             break
                 return
             self.menu_event(event)
@@ -1344,7 +1445,6 @@ class Game:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             pause_rect = pygame.Rect(SCREEN_W - 38, 10, 26, 26)
             if pause_rect.collidepoint(event.pos):
-                self.play("click")
                 self.paused = True
                 self.play("hold")
                 return
@@ -1359,7 +1459,6 @@ class Game:
     def paused_click(self, pos):
         for btn in self.paused_buttons:
             if btn.rect.collidepoint(pos):
-                self.play("click")
                 if btn.action == "resume":
                     self.paused = False
                     self.play("affirmative")
@@ -1391,6 +1490,9 @@ class Game:
             return
         if key == pygame.K_ESCAPE:
             self.placing = None
+            self.repair_mode = False
+            self.repair_target_id = None
+            self.sell_mode = False
             self.paused = False
             self.play("cancel")
             return
@@ -1429,6 +1531,12 @@ class Game:
             self.camera.zoom = max(0.55, self.camera.zoom - 0.1)
             self.clamp_camera()
             return
+        elif key == pygame.K_h:
+            self.activate_repair_tool()
+            return
+        elif key == pygame.K_x:
+            self.activate_sell_tool()
+            return
 
         if pygame.K_a <= key <= pygame.K_z:
             self.cheat_buffer += pygame.key.name(key)
@@ -1462,18 +1570,18 @@ class Game:
             self.train_unit(TRAIN_KEYS[key])
 
     def sell_selected(self):
-        selected = self.selected()
+        selected = [e for e in self.selected() if e.team == TEAM_RED and e.kind == "structure"]
         if not selected:
+            self.alert("Select one of your buildings to sell")
+            self.play("cancel")
             return
         refund = 0
         for entity in selected:
-            if entity.team == TEAM_RED:
-                if entity.kind == "structure":
-                    refund += int(STRUCT_DEFS[entity.type]["cost"] * 0.5)
-                entity.hp = 0
+            refund += int(STRUCT_DEFS[entity.type]["cost"] * 0.5)
+            entity.hp = 0
         self.credits = min(99999, self.credits + refund)
         self.alert(f"Sold for ${refund}")
-        self.play("construction_done" if refund else "cancel")
+        self.play("construction_done")
 
     def menu_event(self, event):
         try:
@@ -1495,17 +1603,7 @@ class Game:
                         self.menu_hover_key = key
                         break
                 return
-            if event.type in (pygame.MOUSEBUTTONUP, pygame.MOUSEBUTTONDOWN) and event.button in (1, 2, 3):
-                mx, my = event.pos
-                for key, rect in self.menu_cards():
-                    if rect.collidepoint(mx, my):
-                        self.start(key)
-                        try:
-                            self.play("click")
-                        except Exception:
-                            pass
-                        break
-        except Exception as e:
+        except Exception:
             import traceback
             traceback.print_exc()
 
@@ -1529,10 +1627,21 @@ class Game:
             self.pan_start = event.pos
             self.pan_cam = (self.camera.x, self.camera.y)
         elif event.button == 3:
+            if self.repair_mode or self.sell_mode:
+                self.repair_mode = False
+                self.repair_target_id = None
+                self.sell_mode = False
+                self.play("cancel")
+                return
             self.select_ids([])
             return
         elif event.button == 1:
-            self.play("click")
+            if self.sell_mode:
+                self.sell_building_at(*self.screen_to_world(mx, my))
+                return
+            if self.repair_mode:
+                self.start_repair_at(*self.screen_to_world(mx, my))
+                return
             if self.placing:
                 self.place_structure(*self.screen_to_world(mx, my))
                 return
@@ -1582,7 +1691,6 @@ class Game:
     def sidebar_click(self, mx, my):
         mini_rect = pygame.Rect(VIEW_W + 22, TOP_H + 80, MINIMAP_W, MINIMAP_H)
         if mini_rect.collidepoint(mx, my):
-            self.play("click")
             rel_x = (mx - mini_rect.x) / mini_rect.w
             rel_y = (my - mini_rect.y) / mini_rect.h
             self.camera.x = rel_x * WORLD_W
@@ -1591,14 +1699,71 @@ class Game:
             return
         for button in self.buttons:
             if button.rect.collidepoint(mx, my):
-                self.play("click")
                 if button.kind == "tab":
                     self.active_tab = button.action
                 elif button.kind == "build":
                     self.try_build(button.action)
                 elif button.kind == "train":
                     self.train_unit(button.action)
+                elif button.kind == "tool" and button.action == "repair":
+                    self.activate_repair_tool()
+                elif button.kind == "tool" and button.action == "sell":
+                    self.activate_sell_tool()
                 return
+
+    def activate_repair_tool(self):
+        if not self.difficulty or self.game_over:
+            return
+        self.placing = None
+        self.sell_mode = False
+        self.repair_mode = True
+        self.alert("Repair tool ready: click a damaged building")
+        self.play("new_options")
+
+    def activate_sell_tool(self):
+        if not self.difficulty or self.game_over:
+            return
+        self.placing = None
+        self.repair_mode = False
+        self.repair_target_id = None
+        self.sell_mode = True
+        self.alert("Sell tool ready: click one of your buildings")
+        self.play("new_options")
+
+    def start_repair_at(self, wx, wy):
+        target = self.hit_entity(wx, wy, TEAM_RED)
+        if not target or target.kind != "structure":
+            self.alert("Repair works on your buildings only")
+            self.play("cancel")
+            return
+        if target.hp >= target.max_hp:
+            return
+        if self.credits < REPAIR_COST:
+            self.alert("Insufficient credits for repair")
+            self.play("insufficient")
+            return
+        self.repair_target_id = target.id
+        self.repair_timer = 0
+        self.alert(f"Repairing {STRUCT_DEFS[target.type]['name']} (${REPAIR_COST}/tick)")
+        self.play("build_start")
+
+    def sell_building_at(self, wx, wy):
+        target = self.hit_entity(wx, wy, TEAM_RED)
+        if not target or target.kind != "structure":
+            self.alert("Sell works on your buildings only")
+            self.play("cancel")
+            return
+        self.sell_building(target)
+
+    def sell_building(self, building):
+        refund = int(STRUCT_DEFS[building.type]["cost"] * 0.5)
+        self.credits = min(99999, self.credits + refund)
+        if self.repair_target_id == building.id:
+            self.repair_target_id = None
+        building.hp = 0
+        self.refresh_navigation()
+        self.alert(f"Sold {STRUCT_DEFS[building.type]['name']} for ${refund}")
+        self.play("construction_done")
 
     def command_selected(self, mx, my):
         wx, wy = self.screen_to_world(mx, my)
@@ -1659,6 +1824,7 @@ class Game:
 
     def draw(self):
         if not self.difficulty:
+            pygame.mouse.set_visible(True)
             self.draw_menu()
             return
         self.screen.fill((8, 8, 8))
@@ -1672,6 +1838,7 @@ class Game:
             text = "VICTORY" if self.winner == TEAM_RED else "DEFEAT"
             self.draw_center_banner(text, "Press R for menu")
         self.draw_nav_vis_overlay()
+        self.draw_repair_cursor()
 
     def draw_menu(self):
         # Ultra dark background for contrast
@@ -2099,6 +2266,7 @@ class Game:
         else:
             pygame.draw.rect(self.screen, entity.color, rect)
             pygame.draw.rect(self.screen, (45, 25, 18), rect, 2)
+        self.draw_production_marker(entity, rect)
         if entity.selected:
             pygame.draw.rect(self.screen, (255, 225, 40), rect, 2)
             if entity.atk > 0:
@@ -2107,7 +2275,41 @@ class Game:
             if entity.type == "radar":
                 cx, cy = self.world_to_screen(*entity.center())
                 pygame.draw.circle(self.screen, (240, 200, 60), (round(cx), round(cy)), round(300 * self.camera.zoom), 1)
+        if self.repair_target_id == entity.id:
+            pygame.draw.rect(self.screen, (90, 235, 255), rect.inflate(4, 4), 2, border_radius=3)
         self.draw_health(entity, rect)
+
+    def draw_production_marker(self, entity, rect):
+        if entity.team != TEAM_RED or not self.training_queue:
+            return
+        unit_type = self.training_queue[0]
+        if entity.type != self.producer_type_for_unit(unit_type):
+            return
+
+        pct = clamp(self.training_timer / max(3, UNIT_DEFS[unit_type]["cost"] / 200), 0, 1)
+        pulse = 0.55 + 0.45 * math.sin(pygame.time.get_ticks() / 120)
+        color = (255, 178, 55) if entity.type == "warfactory" else (95, 215, 255)
+        label = "VEH" if entity.type == "warfactory" else "INF"
+
+        bay_w = max(16, round(rect.w * (0.42 if entity.type == "warfactory" else 0.32)))
+        bay_h = max(6, round(rect.h * 0.12))
+        bay = pygame.Rect(0, 0, bay_w, bay_h)
+        bay.centerx = rect.centerx
+        bay.bottom = rect.bottom + max(2, round(4 * self.camera.zoom))
+
+        glow = pygame.Surface((bay.w + 18, bay.h + 18), pygame.SRCALPHA)
+        pygame.draw.ellipse(glow, (*color, round(85 * pulse)), glow.get_rect())
+        self.screen.blit(glow, (bay.centerx - glow.get_width() // 2, bay.centery - glow.get_height() // 2))
+        pygame.draw.rect(self.screen, (18, 10, 8), bay, border_radius=2)
+        pygame.draw.rect(self.screen, color, bay, max(1, round(2 * self.camera.zoom)), border_radius=2)
+
+        fill = bay.copy()
+        fill.w = max(1, round(bay.w * pct))
+        pygame.draw.rect(self.screen, (*color, 180), fill, border_radius=2)
+
+        if self.camera.zoom >= 0.75:
+            text = self.small.render(label, True, (255, 245, 190))
+            self.screen.blit(text, text.get_rect(center=(bay.centerx, bay.y - 7)))
 
     def draw_unit(self, entity):
         sx, sy = self.world_to_screen(entity.x, entity.y)
@@ -2192,6 +2394,49 @@ class Game:
             self.screen.blit(surf, surf.get_rect(center=(sx, sy)))
         else:
             pygame.draw.circle(self.screen, particle.color, (round(sx), round(sy)), max(1, round(particle.size)))
+
+    def draw_hammer_icon(self, rect):
+        handle = (130, 78, 38)
+        handle_edge = (62, 34, 18)
+        metal = (210, 220, 220)
+        metal_dark = (105, 118, 124)
+        x1 = rect.x + rect.w * 0.30
+        y1 = rect.y + rect.h * 0.78
+        x2 = rect.x + rect.w * 0.65
+        y2 = rect.y + rect.h * 0.34
+        pygame.draw.line(self.screen, handle_edge, (x1, y1), (x2, y2), max(4, rect.w // 9))
+        pygame.draw.line(self.screen, handle, (x1, y1), (x2, y2), max(2, rect.w // 14))
+        head = pygame.Rect(0, 0, max(18, rect.w // 2), max(9, rect.h // 5))
+        head.center = (round(rect.x + rect.w * 0.67), round(rect.y + rect.h * 0.29))
+        pygame.draw.rect(self.screen, metal_dark, head.inflate(4, 4), border_radius=2)
+        pygame.draw.rect(self.screen, metal, head, border_radius=2)
+        pygame.draw.line(self.screen, (255, 255, 240), (head.left + 3, head.top + 2), (head.right - 3, head.top + 2), 1)
+
+    def draw_sell_icon(self, rect):
+        coin = (244, 185, 52)
+        coin_edge = (116, 72, 18)
+        red = (230, 54, 38)
+        cx, cy = rect.center
+        radius = max(8, min(rect.w, rect.h) // 4)
+        pygame.draw.circle(self.screen, coin_edge, (cx, cy), radius + 3)
+        pygame.draw.circle(self.screen, coin, (cx, cy), radius)
+        dollar = self.font.render("$", True, (72, 45, 16))
+        self.screen.blit(dollar, dollar.get_rect(center=(cx, cy)))
+        pygame.draw.line(self.screen, red, (rect.left + 8, rect.bottom - 8), (rect.right - 8, rect.top + 8), max(3, rect.w // 11))
+
+    def draw_repair_cursor(self):
+        active = (self.repair_mode or self.sell_mode) and self.difficulty and not self.paused and not self.game_over
+        pygame.mouse.set_visible(not active)
+        if not active:
+            return
+        mx, my = pygame.mouse.get_pos()
+        rect = pygame.Rect(mx - 6, my - 2, 34, 34)
+        if self.sell_mode:
+            self.draw_sell_icon(rect)
+        else:
+            self.draw_hammer_icon(rect)
+        if self.repair_mode and self.credits < REPAIR_COST:
+            pygame.draw.line(self.screen, (245, 45, 35), (mx - 4, my + 26), (mx + 24, my - 2), 3)
 
     def draw_placement_preview(self):
         mx, my = pygame.mouse.get_pos()
@@ -2470,7 +2715,9 @@ class Game:
                 ("barracks", "2", "Build"),
                 ("warfactory", "3", "Build"),
                 ("refinery", "4", "Build"),
-                ("radar", "7", "Build")
+                ("radar", "7", "Build"),
+                ("repair", "H", "Tool"),
+                ("sell", "X", "Tool")
             ]
         elif self.active_tab == "defn":
             active_items = [
@@ -2518,7 +2765,23 @@ class Game:
                         locked = True
                         lock_reason = "REQ: FACTORY"
                         
-            data = STRUCT_DEFS[item_id] if item_kind == "Build" else UNIT_DEFS[item_id]
+            if item_kind == "Build":
+                data = STRUCT_DEFS[item_id]
+            elif item_kind == "Train":
+                data = UNIT_DEFS[item_id]
+            else:
+                data = {
+                    "repair": {
+                        "name": "Repair",
+                        "cost": REPAIR_COST,
+                        "color": (90, 190, 220),
+                    },
+                    "sell": {
+                        "name": "Sell",
+                        "cost": 0,
+                        "color": (230, 150, 70),
+                    },
+                }[item_id]
             cost = data["cost"]
             
             # Hover / selected highlight
@@ -2526,7 +2789,11 @@ class Game:
             hovered = card_rect.collidepoint(mouse_pos)
             
             # Highlight gold if placing or active
-            is_active_placing = (self.placing == item_id)
+            is_active_placing = (
+                (self.placing == item_id)
+                or (item_id == "repair" and self.repair_mode)
+                or (item_id == "sell" and self.sell_mode)
+            )
             
             # Card border and bg colors
             bg_color = (25, 12, 38)
@@ -2551,7 +2818,11 @@ class Game:
             icon_rect = pygame.Rect(cx + 12, cy + 6, card_w - 24, 46)
             
             asset = self.assets.get(icon_key)
-            if asset:
+            if item_id == "repair":
+                self.draw_hammer_icon(icon_rect)
+            elif item_id == "sell":
+                self.draw_sell_icon(icon_rect)
+            elif asset:
                 self.blit_fit(asset, icon_rect, 1.0)
             else:
                 # Color block representing item
@@ -2575,7 +2846,8 @@ class Game:
             self.screen.blit(name_lbl, (cx + 6, cy + 54))
             
             # Cost at bottom-right
-            cost_lbl = self.small.render(f"${cost}", True, (245, 185, 45))
+            cost_text = f"${cost}" if cost else "50%"
+            cost_lbl = self.small.render(cost_text, True, (245, 185, 45))
             self.screen.blit(cost_lbl, (cx + card_w - cost_lbl.get_width() - 6, cy + 54))
             
             # 4. Status overlay text (Locked, Ready, Training Progress)
@@ -2588,7 +2860,8 @@ class Game:
                 # Flashing READY text for buildings
                 if int(pygame.time.get_ticks() / 300) % 2 == 0:
                     pygame.draw.rect(self.screen, (12, 5, 20), (cx + 12, cy + 24, card_w - 24, 18), border_radius=2)
-                    ready_lbl = self.small.render("READY", True, (245, 185, 45))
+                    active_label = "REPAIR" if item_id == "repair" else "SELL" if item_id == "sell" else "READY"
+                    ready_lbl = self.small.render(active_label, True, (245, 185, 45))
                     self.screen.blit(ready_lbl, ready_lbl.get_rect(center=(cx + card_w // 2, cy + 33)))
             elif item_kind == "Train" and self.training_queue:
                 # Check queue count
@@ -2615,7 +2888,13 @@ class Game:
                         self.screen.blit(hold_lbl, hold_lbl.get_rect(center=(cx + card_w - 21, cy + 11)))
                         
             # Store button for clicks
-            self.buttons.append(Button(card_rect, data["name"], item_id, "build" if item_kind == "Build" else "train"))
+            if item_kind == "Build":
+                button_kind = "build"
+            elif item_kind == "Train":
+                button_kind = "train"
+            else:
+                button_kind = "tool"
+            self.buttons.append(Button(card_rect, data["name"], item_id, button_kind))
             
         # Draw selected units info console (Yuri vector display)
         info_y = TOP_H + VIEW_H - 104
@@ -2674,7 +2953,7 @@ class Game:
     def draw_bottombar(self):
         y = SCREEN_H - BOTTOM_H
         pygame.draw.rect(self.screen, (18, 16, 14), (0, y, SCREEN_W, BOTTOM_H))
-        text = "Left drag: select   Right click: move/attack   Mouse wheel: zoom   Middle drag/arrows: pan   G: nav grid   Delete: sell"
+        text = "Left drag: select   Right click: move/attack/cancel tool   H: repair   X/Sell: sell building   Delete: sell selected building"
         surf = self.small.render(text, True, (190, 170, 140))
         self.screen.blit(surf, (18, y + 9))
         queue = ", ".join(self.training_queue[:5]) if self.training_queue else "empty"
@@ -2723,12 +3002,12 @@ def main():
     game = Game(screen, clock, font, small, big)
     try:
         game.load_assets()
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
     try:
         game.load_sounds()
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
 
@@ -2740,7 +3019,7 @@ def main():
             game.update(min(dt, 0.05))
             game.draw()
             pygame.display.flip()
-        except Exception as e:
+        except Exception:
             import traceback
             traceback.print_exc()
             pygame.display.flip()
