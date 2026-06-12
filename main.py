@@ -142,7 +142,7 @@ UNIT_DEFS = {
     "apocalypse": {
         "name": "Apocalypse",
         "hp": 600,
-        "spd": 45,
+        "spd": 55,
         "atk": 120,
         "range": 140,
         "atk_spd": 2.0,
@@ -373,6 +373,15 @@ class Particle:
 
 
 @dataclass
+class TeslaZap:
+    points: list[tuple[float, float]]
+    ttl: float
+    max_ttl: float
+    color: tuple
+    width: float = 3
+
+
+@dataclass
 class Button:
     rect: pygame.Rect
     label: str
@@ -567,6 +576,7 @@ class Game:
     entities: list[Entity] = field(default_factory=list)
     ore: list[Ore] = field(default_factory=list)
     particles: list[Particle] = field(default_factory=list)
+    tesla_zaps: list[TeslaZap] = field(default_factory=list)
     buttons: list[Button] = field(default_factory=list)
     selected_ids: list[int] = field(default_factory=list)
     training_queue: list[str] = field(default_factory=list)
@@ -777,6 +787,7 @@ class Game:
         self.entities.clear()
         self.ore.clear()
         self.particles.clear()
+        self.tesla_zaps.clear()
         self.selected_ids.clear()
         self.training_queue.clear()
         self.next_id = 1
@@ -981,6 +992,7 @@ class Game:
         self.remove_dead()
         self.recalc_power()
         self.update_particles(dt)
+        self.update_tesla_zaps(dt)
         if self.message_timer > 0:
             self.message_timer -= dt
 
@@ -1073,21 +1085,26 @@ class Game:
     def nearest_walkable_release_point(self, x, y, size):
         if self.nav_grid.is_walkable_world(x, y):
             return x, y
-        offsets = [
-            (0, NAV_TILE),
-            (NAV_TILE, NAV_TILE),
-            (-NAV_TILE, NAV_TILE),
-            (NAV_TILE * 2, NAV_TILE),
-            (-NAV_TILE * 2, NAV_TILE),
-            (0, NAV_TILE * 2),
-            (NAV_TILE * 2, NAV_TILE * 2),
-            (-NAV_TILE * 2, NAV_TILE * 2),
-        ]
-        for dx, dy in offsets:
-            nx = clamp(x + dx, size, WORLD_W - size)
-            ny = clamp(y + dy, size, WORLD_H - size)
-            if self.nav_grid.is_walkable_world(nx, ny):
-                return nx, ny
+
+        start_gx, start_gy = self.nav_grid.cell(x, y)
+        nearest = self.nav_grid.nearest_walkable_cell(start_gx, start_gy, 12)
+        if nearest:
+            nx, ny = self.nav_grid.cell_center(*nearest)
+            return clamp(nx, size, WORLD_W - size), clamp(ny, size, WORLD_H - size)
+
+        for radius in range(1, 9):
+            for dx in range(-radius, radius + 1):
+                for dy in (-radius, radius):
+                    nx = clamp(x + dx * NAV_TILE, size, WORLD_W - size)
+                    ny = clamp(y + dy * NAV_TILE, size, WORLD_H - size)
+                    if self.nav_grid.is_walkable_world(nx, ny):
+                        return nx, ny
+            for dy in range(-radius + 1, radius):
+                for dx in (-radius, radius):
+                    nx = clamp(x + dx * NAV_TILE, size, WORLD_W - size)
+                    ny = clamp(y + dy * NAV_TILE, size, WORLD_H - size)
+                    if self.nav_grid.is_walkable_world(nx, ny):
+                        return nx, ny
         return x, y
 
     def update_ore(self, dt):
@@ -1176,7 +1193,10 @@ class Game:
                     self.base_warning_timer = 12
                 entity.atk_timer = entity.atk_spd
                 tx, ty = target.center()
-                self.add_burst(tx, ty, (255, 190, 80), 5)
+                if self.is_tesla_attacker(entity):
+                    self.add_tesla_zap(entity, target)
+                else:
+                    self.add_burst(tx, ty, (255, 190, 80), 5)
                 self.particles.append(Particle(tx, ty - 12, 0, -20, 0.7, (255, 230, 150), 1, str(round(dmg))))
                 if target.kind == "unit" and target.team == TEAM_RED and not target.target_id:
                     target.target_id = entity.id
@@ -1303,6 +1323,43 @@ class Game:
             angle = random.random() * math.tau
             speed = random.uniform(20, 90)
             self.particles.append(Particle(x, y, math.cos(angle) * speed, math.sin(angle) * speed, random.uniform(0.25, 0.75), color, random.uniform(2, 5)))
+
+    def is_tesla_attacker(self, entity):
+        return entity.type in ("tesla", "turret", "tesla_trooper")
+
+    def zap_origin(self, entity):
+        if entity.kind == "structure":
+            cx, cy = entity.center()
+            return cx, entity.y + entity.h * 0.18
+        return entity.x, entity.y - entity.size * 0.45
+
+    def add_tesla_zap(self, source, target):
+        sx, sy = self.zap_origin(source)
+        tx, ty = target.center()
+        segments = max(5, min(12, round(distance_xy(sx, sy, tx, ty) / 28)))
+        dx = tx - sx
+        dy = ty - sy
+        length = max(1, math.hypot(dx, dy))
+        nx = -dy / length
+        ny = dx / length
+        points = []
+        for i in range(segments + 1):
+            t = i / segments
+            jitter = 0 if i in (0, segments) else random.uniform(-12, 12)
+            points.append((sx + dx * t + nx * jitter, sy + dy * t + ny * jitter))
+        color = (135, 225, 255) if source.type != "tesla" else (190, 245, 255)
+        self.tesla_zaps.append(TeslaZap(points, 0.18, 0.18, color, 4 if source.type == "tesla" else 3))
+        self.tesla_zaps.append(TeslaZap(points[::2] if len(points) > 4 else points, 0.10, 0.10, (255, 255, 255), 2))
+        self.add_burst(tx, ty, (120, 225, 255), 10)
+        for _ in range(5):
+            angle = random.random() * math.tau
+            speed = random.uniform(45, 130)
+            self.particles.append(Particle(tx, ty, math.cos(angle) * speed, math.sin(angle) * speed, random.uniform(0.12, 0.32), (205, 245, 255), random.uniform(2, 4)))
+
+    def update_tesla_zaps(self, dt):
+        for zap in self.tesla_zaps:
+            zap.ttl -= dt
+        self.tesla_zaps = [zap for zap in self.tesla_zaps if zap.ttl > 0]
 
     def update_particles(self, dt):
         for particle in self.particles:
@@ -1799,6 +1856,8 @@ class Game:
         radius = entity.size * 1.8
         if entity.type == "v3":
             radius = max(radius, 44)
+        elif entity.type == "apocalypse":
+            radius = max(radius, 48)
         return radius
 
     def select_ids(self, ids, add=False):
@@ -2127,6 +2186,8 @@ class Game:
                 self.draw_ore(ore)
         for entity in sorted(self.entities, key=lambda e: (e.y, e.kind == "unit")):
             self.draw_entity(entity)
+        for zap in self.tesla_zaps:
+            self.draw_tesla_zap(zap)
         for particle in self.particles:
             self.draw_particle(particle)
         if self.placing:
@@ -2319,7 +2380,10 @@ class Game:
         pygame.draw.ellipse(self.screen, (0, 0, 0, 110), (sx - r, sy + r * 0.35, r * 2.2, r * 0.8))
         asset = self.unit_asset(entity)
         if asset:
-            rect = pygame.Rect(0, 0, round(r * 3.0), round(r * 3.0))
+            if entity.type == "apocalypse" and entity.team == TEAM_RED:
+                asset = pygame.transform.rotozoom(asset, -math.degrees(entity.facing), 1.0)
+            draw_scale = 3.7 if entity.type == "apocalypse" else 3.0
+            rect = pygame.Rect(0, 0, round(r * draw_scale), round(r * draw_scale))
             rect.center = (round(sx), round(sy))
             self.blit_fit(asset, rect, 1)
         else:
@@ -2394,6 +2458,27 @@ class Game:
             self.screen.blit(surf, surf.get_rect(center=(sx, sy)))
         else:
             pygame.draw.circle(self.screen, particle.color, (round(sx), round(sy)), max(1, round(particle.size)))
+
+    def draw_tesla_zap(self, zap):
+        if len(zap.points) < 2:
+            return
+        alpha = clamp(zap.ttl / zap.max_ttl, 0, 1)
+        points = [self.world_to_screen(x, y) for x, y in zap.points]
+        points = [(round(x), round(y)) for x, y in points]
+        glow_width = max(2, round((zap.width + 5) * self.camera.zoom))
+        core_width = max(1, round(zap.width * self.camera.zoom))
+        glow_color = (*zap.color, round(70 * alpha))
+        core_color = (240, 255, 255, round(235 * alpha))
+
+        overlay = pygame.Surface((VIEW_W, VIEW_H), pygame.SRCALPHA)
+        local_points = [(x, y - TOP_H) for x, y in points]
+        if len(local_points) >= 2:
+            pygame.draw.lines(overlay, glow_color, False, local_points, glow_width)
+            pygame.draw.lines(overlay, (*zap.color, round(185 * alpha)), False, local_points, max(1, core_width + 1))
+            pygame.draw.lines(overlay, core_color, False, local_points, core_width)
+            for x, y in local_points[1:-1:2]:
+                pygame.draw.circle(overlay, (210, 250, 255, round(120 * alpha)), (x, y), max(2, round(4 * self.camera.zoom)))
+        self.screen.blit(overlay, (0, TOP_H))
 
     def draw_hammer_icon(self, rect):
         handle = (130, 78, 38)
