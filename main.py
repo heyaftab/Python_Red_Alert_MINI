@@ -131,7 +131,7 @@ UNIT_DEFS = {
         "range": 200,
         "atk_spd": 3.0,
         "sight": 180,
-        "size": 14,
+        "size": 18,
         "cost": 1200,
         "color": (110, 70, 26),
         "category": "vehicle",
@@ -275,13 +275,21 @@ STRUCT_DEFS = {
 
 BUILD_KEYS = {
     pygame.K_1: "powerplant",
+    pygame.K_KP_1: "powerplant",
     pygame.K_2: "barracks",
+    pygame.K_KP_2: "barracks",
     pygame.K_3: "warfactory",
+    pygame.K_KP_3: "warfactory",
     pygame.K_4: "refinery",
+    pygame.K_KP_4: "refinery",
     pygame.K_5: "turret",
+    pygame.K_KP_5: "turret",
     pygame.K_6: "tesla",
+    pygame.K_KP_6: "tesla",
     pygame.K_7: "radar",
+    pygame.K_KP_7: "radar",
     pygame.K_8: "wall",
+    pygame.K_KP_8: "wall",
 }
 
 TRAIN_KEYS = {
@@ -998,7 +1006,10 @@ class Game:
         if self.training_timer >= train_time:
             self.training_timer = 0
             self.training_queue.pop(0)
-            src = next((e for e in self.entities if e.team == TEAM_RED and e.type in ("barracks", "warfactory")), None)
+            producer = "warfactory" if unit_type in ("rhino", "v3", "apocalypse") else "barracks"
+            src = next((e for e in self.entities if e.team == TEAM_RED and e.type == producer), None)
+            if not src:
+                src = next((e for e in self.entities if e.team == TEAM_RED and e.type in ("barracks", "warfactory")), None)
             sx, sy = (300, 650) if not src else (src.x + src.w / 2, src.y + src.h + 20)
             unit = self.spawn_unit(unit_type, sx + random.uniform(-24, 24), sy + random.uniform(0, 30), TEAM_RED)
             self.entities.append(unit)
@@ -1042,6 +1053,8 @@ class Game:
             return
         entity.atk_timer = max(0, entity.atk_timer - dt)
         target = self.entity_by_id(entity.target_id) if entity.target_id else None
+        if entity.kind == "unit" and entity.state == "move" and not entity.attack_move and not target:
+            return
         if not target or target.hp <= 0:
             target = self.find_target(entity)
             entity.target_id = target.id if target else None
@@ -1099,6 +1112,7 @@ class Game:
                 unit.path.pop(0)
             if not unit.path and distance_xy(unit.x, unit.y, unit.tx, unit.ty) <= NAV_TILE:
                 unit.path_goal = None
+                unit.state = "idle"
             return
         unit.facing = math.atan2(dy, dx)
         step = min(d, unit.spd * dt)
@@ -1113,6 +1127,7 @@ class Game:
                 unit.tx = unit.x
                 unit.ty = unit.y
                 unit.path_goal = None
+                unit.state = "idle"
         unit.x = clamp(unit.x, 0, WORLD_W)
         unit.y = clamp(unit.y, 0, WORLD_H)
 
@@ -1199,10 +1214,6 @@ class Game:
         if not self.difficulty or self.game_over:
             return
         data = STRUCT_DEFS[struct_type]
-        if struct_type in ("barracks", "warfactory") and any(e.type == struct_type and e.team == TEAM_RED for e in self.entities):
-            self.alert(f"Already have {data['name']}")
-            self.play("cancel")
-            return
         if self.credits < data["cost"]:
             self.alert("Insufficient credits")
             self.play("insufficient")
@@ -1314,7 +1325,6 @@ class Game:
 
         if not self.difficulty:
             if event.type in (pygame.MOUSEBUTTONUP, pygame.MOUSEBUTTONDOWN):
-                import sys
                 print(f"[MENU] Button {event.button} {event.type} at {event.pos}", file=sys.stderr)
                 if event.button in (1, 2, 3):
                     mx, my = event.pos
@@ -1616,9 +1626,15 @@ class Game:
             if entity.kind == "structure":
                 if entity.rect().collidepoint(wx, wy):
                     return entity
-            elif distance_xy(wx, wy, entity.x, entity.y) <= entity.size * 1.8:
+            elif distance_xy(wx, wy, entity.x, entity.y) <= self.unit_hit_radius(entity):
                 return entity
         return None
+
+    def unit_hit_radius(self, entity):
+        radius = entity.size * 1.8
+        if entity.type == "v3":
+            radius = max(radius, 44)
+        return radius
 
     def select_ids(self, ids, add=False):
         if add:
@@ -2016,13 +2032,53 @@ class Game:
 
     def draw_ore(self, ore):
         sx, sy = self.world_to_screen(ore.x, ore.y)
-        if not self.on_view(sx, sy, 30):
+        if not self.on_view(sx, sy, 44):
             return
-        pygame.draw.circle(self.screen, (92, 58, 12), (sx, sy), 15 * self.camera.zoom)
-        for i in range(4):
-            px = sx + math.cos(i * 1.7) * 8 * self.camera.zoom
-            py = sy + math.sin(i * 1.2) * 7 * self.camera.zoom
-            pygame.draw.polygon(self.screen, (240, 190, 35), [(px, py - 9), (px + 7, py), (px + 1, py + 9), (px - 6, py + 2)])
+        zoom = self.camera.zoom
+        tick = pygame.time.get_ticks() / 1000
+        pulse = 0.5 + 0.5 * math.sin(tick * 4.4 + ore.x * 0.03 + ore.y * 0.02)
+        shimmer = 0.5 + 0.5 * math.sin(tick * 7.0 + ore.x * 0.01)
+        cx, cy = round(sx), round(sy)
+
+        glow_r = max(10, round((16 + 5 * pulse) * zoom))
+        glow = pygame.Surface((glow_r * 2 + 4, glow_r * 2 + 4), pygame.SRCALPHA)
+        gc = glow_r + 2
+        for layer in range(4):
+            radius = max(1, glow_r - layer * max(2, round(3 * zoom)))
+            alpha = max(0, round((42 + 28 * pulse) * (1 - layer / 4)))
+            pygame.draw.circle(glow, (255, 216, 70, alpha), (gc, gc), radius)
+        self.screen.blit(glow, (cx - gc, cy - gc))
+
+        shadow_w = max(6, round(14 * zoom))
+        shadow_h = max(3, round(5 * zoom))
+        pygame.draw.ellipse(
+            self.screen,
+            (45, 28, 8),
+            pygame.Rect(cx - shadow_w // 2, cy + round(7 * zoom), shadow_w, shadow_h),
+        )
+
+        def draw_diamond(dx, dy, size, fill, edge):
+            px = cx + round(dx * zoom)
+            py = cy + round(dy * zoom)
+            r = max(3, round(size * zoom * (0.88 + pulse * 0.1)))
+            points = [(px, py - r), (px + r, py), (px, py + r), (px - r, py)]
+            pygame.draw.polygon(self.screen, edge, points)
+            inner = max(2, r - max(1, round(2 * zoom)))
+            inner_points = [(px, py - inner), (px + inner, py), (px, py + inner), (px - inner, py)]
+            pygame.draw.polygon(self.screen, fill, inner_points)
+            glint = max(1, round(r * 0.35))
+            pygame.draw.line(self.screen, (255, 255, 210), (px - glint, py - glint), (px, py - r + 1), max(1, round(zoom)))
+
+        draw_diamond(0, 0, 7, (255, 220, 72), (122, 77, 18))
+        draw_diamond(-7, 5, 4.2, (245, 183, 45), (104, 64, 14))
+        draw_diamond(7, 4, 3.8, (255, 239, 126), (119, 75, 17))
+
+        if shimmer > 0.72:
+            sparkle_r = max(2, round(4 * zoom * shimmer))
+            sparkle_x = cx + round(10 * zoom)
+            sparkle_y = cy - round(10 * zoom)
+            pygame.draw.line(self.screen, (255, 250, 180), (sparkle_x - sparkle_r, sparkle_y), (sparkle_x + sparkle_r, sparkle_y), 1)
+            pygame.draw.line(self.screen, (255, 250, 180), (sparkle_x, sparkle_y - sparkle_r), (sparkle_x, sparkle_y + sparkle_r), 1)
 
     def draw_entity(self, entity):
         if entity.kind == "structure":
